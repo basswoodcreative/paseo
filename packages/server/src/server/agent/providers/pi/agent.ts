@@ -7,6 +7,7 @@ import type { Logger } from "pino";
 import stripAnsi from "strip-ansi";
 import { z } from "zod";
 
+import { createRealpathAwarePathMatcher } from "../../../../utils/path.js";
 import {
   type AgentCapabilityFlags,
   type AgentClient,
@@ -44,6 +45,16 @@ import {
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
 import { runProviderTurn } from "../provider-runner.js";
+import { HerdrAttachedPiSession } from "./herdr-attached-session.js";
+import {
+  encodeHerdrAttachedPiHandle,
+  HERDR_ATTACHED_PI_RUNTIME,
+  isAttachableHerdrPiAgent,
+  parseHerdrAttachedPiHandle,
+  parseHerdrAttachedPiMetadata,
+  type HerdrAttachedPiMetadata,
+} from "./herdr-attachment.js";
+import { HerdrCliClient, type HerdrAgent, type HerdrClient } from "./herdr-client.js";
 import {
   checkProviderLaunchAvailable,
   resolveProviderLaunch,
@@ -73,6 +84,7 @@ import {
 } from "./extensions/index.js";
 import { revertPiConversation } from "./rewind.js";
 import { listPiImportableSessions, readPiImportSessionConfig } from "./session-descriptor.js";
+import { readPiNativeHistory } from "./native-history.js";
 import type { PiRuntime, PiRuntimeSession, PiStartSessionInput } from "./runtime.js";
 import type {
   PiAgentSessionEvent,
@@ -106,13 +118,28 @@ const DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PI_RPC_TIMEOUT_MS = 60_000;
 const QUESTION_RESPONSE_HEADER = "Response";
 
+const PiHerdrProviderOptionsSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    command: z.array(z.string().min(1)).min(1).optional(),
+    session: z.string().min(1).optional(),
+    timeoutMs: z.number().int().positive().default(10_000),
+    pollIntervalMs: z.number().int().positive().default(1_000),
+    interruptKeys: z.array(z.string().min(1)).optional(),
+  })
+  .strict()
+  .default({ enabled: false, timeoutMs: 10_000, pollIntervalMs: 1_000 });
+
 export const PiProviderOptionsSchema = z
   .object({
     sessionDir: z.string().min(1).optional(),
     rpcTimeoutMs: z.number().int().positive().default(DEFAULT_PI_RPC_TIMEOUT_MS),
     extensionTimeoutMs: z.number().int().positive().default(DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS),
+    herdr: PiHerdrProviderOptionsSchema,
   })
   .strict();
+
+export type PiProviderOptions = z.infer<typeof PiProviderOptionsSchema>;
 
 const PI_HANDLED_BUILTIN_SLASH_COMMANDS: AgentSlashCommand[] = [
   {
@@ -185,7 +212,9 @@ const PI_THINKING_OPTIONS: ReadonlyArray<{
 export interface PiRpcAgentClientOptions {
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
+  providerParams?: unknown;
   runtime?: PiRuntime;
+  herdrClient?: HerdrClient | null;
   usagePollScheduler?: PiUsagePollScheduler;
 }
 
@@ -1164,6 +1193,38 @@ function createRuntime(
     commandsRpcName: "get_commands",
     requestTimeoutMs,
   });
+}
+
+function createHerdrClient(providerOptions: PiProviderOptions): HerdrClient | null {
+  if (!providerOptions.herdr.enabled) {
+    return null;
+  }
+  return new HerdrCliClient({
+    ...(providerOptions.herdr.command
+      ? { command: providerOptions.herdr.command as [string, ...string[]] }
+      : {}),
+    ...(providerOptions.herdr.session ? { session: providerOptions.herdr.session } : {}),
+    timeoutMs: providerOptions.herdr.timeoutMs,
+    ...(providerOptions.herdr.interruptKeys
+      ? { interruptKeys: providerOptions.herdr.interruptKeys }
+      : {}),
+  });
+}
+
+async function collectPiHistoryTimeline(events: AsyncGenerator<AgentStreamEvent>) {
+  const timeline: Array<{
+    item: Extract<AgentStreamEvent, { type: "timeline" }>["item"];
+    timestamp?: string;
+  }> = [];
+  for await (const event of events) {
+    if (event.type === "timeline") {
+      timeline.push({
+        item: event.item,
+        ...(event.timestamp ? { timestamp: event.timestamp } : {}),
+      });
+    }
+  }
+  return timeline;
 }
 
 export class PiRpcAgentSession implements AgentSession {
@@ -2490,7 +2551,9 @@ export class PiRpcAgentClient implements AgentClient {
 
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
+  private readonly providerOptions: PiProviderOptions;
   private readonly runtime?: PiRuntime;
+  private readonly herdrClient: HerdrClient | null;
   private readonly usagePollScheduler?: PiUsagePollScheduler;
 
   constructor(options: PiRpcAgentClientOptions) {
@@ -2498,7 +2561,12 @@ export class PiRpcAgentClient implements AgentClient {
     this.capabilities = capabilitiesForClient();
     this.logger = options.logger;
     this.runtimeSettings = options.runtimeSettings;
+    this.providerOptions = PiProviderOptionsSchema.parse(options.providerParams ?? {});
     this.runtime = options.runtime;
+    this.herdrClient =
+      options.herdrClient === undefined
+        ? createHerdrClient(this.providerOptions)
+        : options.herdrClient;
     this.usagePollScheduler = options.usagePollScheduler;
   }
 
@@ -2558,6 +2626,14 @@ export class PiRpcAgentClient implements AgentClient {
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    const attachedMetadata = parseHerdrAttachedPiMetadata(handle.metadata);
+    if (attachedMetadata) {
+      return this.createHerdrAttachedSession(attachedMetadata, overrides);
+    }
+    if (handle.metadata?.runtime === HERDR_ATTACHED_PI_RUNTIME) {
+      throw new Error("Invalid Herdr-attached Pi persistence metadata");
+    }
+
     const sessionFile = handle.nativeHandle;
     if (!sessionFile) {
       throw new Error("Pi resume requires a native session file handle");
@@ -2713,14 +2789,34 @@ export class PiRpcAgentClient implements AgentClient {
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
-    return await listPiImportableSessions({
+    const herdrSessions = await this.listHerdrAttachedImportableSessions(options);
+    const attachedNativeHandles = new Set(
+      herdrSessions.flatMap((session) => {
+        const metadata = parseHerdrAttachedPiHandle(session.providerHandleId);
+        return metadata ? [metadata.nativeSessionFile, metadata.nativeSessionId] : [];
+      }),
+    );
+    const persistedSessions = await listPiImportableSessions({
       ...options,
       sessionDir: PiProviderOptionsSchema.parse(options?.providerOptions ?? {}).sessionDir,
       runtimeSettings: this.runtimeSettings,
     });
+    return [
+      ...herdrSessions,
+      ...persistedSessions.filter(
+        (session) => !attachedNativeHandles.has(session.providerHandleId),
+      ),
+    ]
+      .sort((left, right) => right.lastActivityAt.getTime() - left.lastActivityAt.getTime())
+      .slice(0, options?.limit ?? 20);
   }
 
   async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+    const attachedMetadata = parseHerdrAttachedPiHandle(input.providerHandleId);
+    if (attachedMetadata) {
+      return await this.importHerdrAttachedSession(attachedMetadata, input, context);
+    }
+
     const importConfig = await readPiImportSessionConfig(input.providerHandleId);
     return importSessionFromPersistence({
       provider: this.provider,
@@ -2728,6 +2824,137 @@ export class PiRpcAgentClient implements AgentClient {
       context,
       resumeSession: this.resumeSession.bind(this),
       config: importConfig,
+    });
+  }
+
+  private async listHerdrAttachedImportableSessions(
+    options?: ListImportableSessionsOptions,
+  ): Promise<ImportableProviderSession[]> {
+    if (!this.herdrClient) {
+      return [];
+    }
+
+    let agents: HerdrAgent[];
+    try {
+      agents = await this.herdrClient.listAgents();
+    } catch (error) {
+      this.logger.debug({ err: error }, "Failed to list Herdr agents for Pi import discovery");
+      return [];
+    }
+
+    const matchesCwd = options?.cwd ? createRealpathAwarePathMatcher(options.cwd) : null;
+    const rows: ImportableProviderSession[] = [];
+    for (const agent of agents) {
+      const row = await this.toHerdrImportableSession(agent).catch((error) => {
+        this.logger.debug({ err: error, target: agent.target }, "Failed to inspect Herdr Pi agent");
+        return null;
+      });
+      if (!row || (matchesCwd && !matchesCwd(row.cwd))) {
+        continue;
+      }
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  private async toHerdrImportableSession(
+    agent: HerdrAgent,
+  ): Promise<ImportableProviderSession | null> {
+    if (!this.herdrClient) {
+      return null;
+    }
+    const detailed = isAttachableHerdrPiAgent(agent)
+      ? agent
+      : await this.herdrClient.getAgent(agent.target).catch(() => agent);
+    if (!isAttachableHerdrPiAgent(detailed)) {
+      return null;
+    }
+
+    const { nativeSessionFile, nativeSessionId, cwd } = detailed;
+    if (!nativeSessionFile || !nativeSessionId || !cwd) {
+      return null;
+    }
+
+    const history = await readPiNativeHistory(nativeSessionFile);
+    const metadata: HerdrAttachedPiMetadata = {
+      runtime: HERDR_ATTACHED_PI_RUNTIME,
+      herdrSession: this.providerOptions.herdr.session ?? "default",
+      herdrTarget: detailed.target,
+      ...(detailed.name ? { herdrAlias: detailed.name } : {}),
+      ...(detailed.paneId ? { herdrPaneId: detailed.paneId } : {}),
+      nativeSessionId,
+      nativeSessionFile,
+      cwd,
+    };
+    if (history.sessionId !== metadata.nativeSessionId || history.cwd !== metadata.cwd) {
+      return null;
+    }
+
+    const label = detailed.name ?? detailed.target;
+    return {
+      providerHandleId: encodeHerdrAttachedPiHandle(metadata),
+      cwd: metadata.cwd,
+      title: `Live Pi: ${label}`,
+      firstPromptPreview: null,
+      lastPromptPreview: detailed.status ? `Herdr ${detailed.status}` : "Herdr live Pi",
+      lastActivityAt: history.lastActivityAt ?? detailed.lastActivityAt ?? new Date(),
+    };
+  }
+
+  private async importHerdrAttachedSession(
+    metadata: HerdrAttachedPiMetadata,
+    input: ImportProviderSessionInput,
+    context: ImportProviderSessionContext,
+  ) {
+    const importConfig = await readPiImportSessionConfig(metadata.nativeSessionFile);
+    const config = {
+      ...context.config,
+      ...importConfig,
+      provider: this.provider,
+      cwd: input.cwd,
+    } as AgentSessionConfig;
+    const storedConfig = {
+      ...context.storedConfig,
+      ...importConfig,
+      provider: this.provider,
+      cwd: input.cwd,
+    } as AgentSessionConfig;
+    const session = this.createHerdrAttachedSession({ ...metadata, cwd: input.cwd }, config);
+    const timeline = await collectPiHistoryTimeline(session.streamHistory());
+    return {
+      session,
+      config: storedConfig,
+      persistence: session.describePersistence()!,
+      timeline,
+    };
+  }
+
+  private createHerdrAttachedSession(
+    metadata: HerdrAttachedPiMetadata,
+    overrides?: Partial<AgentSessionConfig>,
+  ): HerdrAttachedPiSession {
+    if (!this.herdrClient) {
+      throw new Error("Herdr attached Pi session requires Herdr support to be enabled");
+    }
+    const configuredHerdrSession = this.providerOptions.herdr.session ?? "default";
+    if (metadata.herdrSession !== configuredHerdrSession) {
+      throw new Error(
+        `Herdr attached Pi session belongs to ${metadata.herdrSession}, not ${configuredHerdrSession}`,
+      );
+    }
+    const config = buildResumeConfig(
+      parsePersistenceMetadata({ ...metadata }),
+      overrides,
+      this.provider,
+    );
+    return new HerdrAttachedPiSession({
+      herdrClient: this.herdrClient,
+      metadata: {
+        ...metadata,
+        cwd: config.cwd,
+      },
+      config: config.config,
+      pollIntervalMs: this.providerOptions.herdr.pollIntervalMs,
     });
   }
 
