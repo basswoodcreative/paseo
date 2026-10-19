@@ -25,6 +25,10 @@ import { buildProviderRegistry } from "./provider-registry.js";
 /** Stand-in for the `herdr` CLI: records its argv, answers with one Pi agent. */
 const FAKE_HERDR_SCRIPT = `
 const fs = require("node:fs");
+if (process.env.HERDR_FAKE_FAIL) {
+  process.stderr.write(process.env.HERDR_FAKE_FAIL + "\\n");
+  process.exit(1);
+}
 const argv = process.argv.slice(2);
 fs.appendFileSync(process.env.HERDR_FAKE_LOG, argv.join(" ") + "\\n");
 const agent = {
@@ -104,11 +108,18 @@ describe("Herdr options reach the Pi provider through the registry factory", () 
   afterEach(() => {
     rmSync(fixture.dir, { recursive: true, force: true });
     delete process.env.HERDR_FAKE_LOG;
+    delete process.env.HERDR_FAKE_FAIL;
     delete process.env.HERDR_FAKE_CWD;
     delete process.env.HERDR_FAKE_SESSION_FILE;
   });
 
   async function listWithConfiguredPi(piOptions: Record<string, unknown>) {
+    // Returns the live client as well: the provider diagnostic reads state off the same
+    // instance the daemon reuses, so a test that checks it must not rebuild the client.
+    return list(piOptions);
+  }
+
+  async function list(piOptions: Record<string, unknown>) {
     process.env.HERDR_FAKE_LOG = fixture.logPath;
     const registry = buildProviderRegistry(createTestLogger(), {
       providerOverrides: { pi: piOptions },
@@ -116,11 +127,11 @@ describe("Herdr options reach the Pi provider through the registry factory", () 
     // No providerParams, no injected herdrClient: exactly what the daemon sends.
     const client = registry.pi.createClient(createTestLogger());
     const sessions = await client.listImportableSessions!({});
-    return sessions.map((session) => session.title ?? null);
+    return { client, titles: sessions.map((session) => session.title ?? null) };
   }
 
   test("config `options` with herdr enabled queries the Herdr CLI", async () => {
-    const titles = await listWithConfiguredPi({
+    const { titles } = await listWithConfiguredPi({
       options: { sessionDir: fixture.sessionDir, herdr: herdrConfig(fixture, "paseo") },
     });
 
@@ -129,7 +140,7 @@ describe("Herdr options reach the Pi provider through the registry factory", () 
   });
 
   test("the deprecated `params` spelling queries it too", async () => {
-    const titles = await listWithConfiguredPi({
+    const { titles } = await listWithConfiguredPi({
       params: { sessionDir: fixture.sessionDir, herdr: herdrConfig(fixture, "paseo") },
     });
 
@@ -138,7 +149,7 @@ describe("Herdr options reach the Pi provider through the registry factory", () 
   });
 
   test("herdr stays unqueried when it is not configured", async () => {
-    const titles = await listWithConfiguredPi({
+    const { titles } = await listWithConfiguredPi({
       options: { sessionDir: fixture.sessionDir },
     });
 
@@ -146,5 +157,22 @@ describe("Herdr options reach the Pi provider through the registry factory", () 
     // every Pi listing into a Herdr subprocess.
     expect(recordedCalls(fixture)).toEqual([]);
     expect(titles).not.toContain("Live Pi: firstmate");
+  });
+
+  test("an enabled but unreachable Herdr is named by the provider diagnostic", async () => {
+    process.env.HERDR_FAKE_FAIL = "daemon socket missing";
+    const { client, titles } = await listWithConfiguredPi({
+      options: { sessionDir: fixture.sessionDir, herdr: herdrConfig(fixture, "paseo") },
+    });
+
+    expect(titles).not.toContain("Live Pi: firstmate");
+    // The failure that started this ticket was invisible: an empty import list looked
+    // exactly like a provider with nothing to import. `paseo provider doctor` reads
+    // `getDiagnostic()`, so an enabled-but-unreachable Herdr has to appear there.
+    const { diagnostic } = await client.getDiagnostic();
+    expect(diagnostic).toContain("Herdr support: enabled but unreachable");
+    // The CLI's own stderr has to survive into the row; "unreachable" on its own would
+    // be true for a missing binary and for a daemon that refused the socket.
+    expect(diagnostic).toContain("daemon socket missing");
   });
 });

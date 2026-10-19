@@ -2565,6 +2565,13 @@ export class PiRpcAgentClient implements AgentClient {
   private readonly injectedHerdrClient: HerdrClient | null;
   /** Keyed by option set: one agent client instance is reused across configs. */
   private readonly herdrClientCache: Map<string, HerdrClient>;
+  /**
+   * Outcome of the most recent Herdr discovery attempt, read by `getDiagnostic()`.
+   * Herdr arrives per call, so this is the only place an explicit-but-unreachable
+   * config can surface: without it the operator sees an empty import list, which is
+   * what a disabled provider looks like too.
+   */
+  private herdrDiscoveryError: string | null;
   private readonly usagePollScheduler?: PiUsagePollScheduler;
 
   constructor(options: PiRpcAgentClientOptions) {
@@ -2575,6 +2582,7 @@ export class PiRpcAgentClient implements AgentClient {
     this.runtime = options.runtime;
     this.injectedHerdrClient = options.herdrClient ?? null;
     this.herdrClientCache = new Map();
+    this.herdrDiscoveryError = null;
     this.usagePollScheduler = options.usagePollScheduler;
   }
 
@@ -2881,16 +2889,19 @@ export class PiRpcAgentClient implements AgentClient {
     const providerOptions = PiProviderOptionsSchema.parse(options?.providerOptions ?? {});
     const herdrClient = this.resolveHerdrClient(providerOptions);
     if (!herdrClient) {
+      this.herdrDiscoveryError = null;
       return [];
     }
 
     let agents: HerdrAgent[];
     try {
       agents = await herdrClient.listAgents();
+      this.herdrDiscoveryError = null;
     } catch (error) {
       // Herdr is explicitly enabled but unreachable. This must not fail silently the way
-      // a disabled provider does: log at info, not debug, so the operator sees why the
-      // "Live Pi:" rows are missing.
+      // a disabled provider does: record it for `getDiagnostic()` and log at info, not
+      // debug, so the operator sees why the "Live Pi:" rows are missing.
+      this.herdrDiscoveryError = error instanceof Error ? error.message : String(error);
       this.logger.info(
         { err: error },
         "Failed to list Herdr agents for Pi import discovery (Herdr is enabled but unreachable)",
@@ -3050,6 +3061,12 @@ export class PiRpcAgentClient implements AgentClient {
           {
             label: "Auth config (~/.pi/agent/auth.json)",
             value: existsSync(authConfigPath) ? "found" : "not found",
+          },
+          {
+            label: "Herdr support",
+            value: this.herdrDiscoveryError
+              ? `enabled but unreachable: ${this.herdrDiscoveryError}`
+              : "available (or not requested this session)",
           },
         ]),
       };
