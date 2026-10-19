@@ -212,8 +212,11 @@ const PI_THINKING_OPTIONS: ReadonlyArray<{
 export interface PiRpcAgentClientOptions {
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
-  providerParams?: unknown;
   runtime?: PiRuntime;
+  /**
+   * Test seam only. The registry factory never passes one, so in production
+   * `resolveHerdrClient` always builds the client from per-call options.
+   */
   herdrClient?: HerdrClient | null;
   usagePollScheduler?: PiUsagePollScheduler;
 }
@@ -1195,10 +1198,7 @@ function createRuntime(
   });
 }
 
-function createHerdrClient(providerOptions: PiProviderOptions): HerdrClient | null {
-  if (!providerOptions.herdr.enabled) {
-    return null;
-  }
+function createHerdrClient(providerOptions: PiProviderOptions): HerdrCliClient {
   return new HerdrCliClient({
     ...(providerOptions.herdr.command
       ? { command: providerOptions.herdr.command as [string, ...string[]] }
@@ -1208,6 +1208,15 @@ function createHerdrClient(providerOptions: PiProviderOptions): HerdrClient | nu
     ...(providerOptions.herdr.interruptKeys
       ? { interruptKeys: providerOptions.herdr.interruptKeys }
       : {}),
+  });
+}
+
+function herdrClientCacheKey(herdr: PiProviderOptions["herdr"]): string {
+  return JSON.stringify({
+    command: herdr.command ?? null,
+    session: herdr.session ?? null,
+    timeoutMs: herdr.timeoutMs,
+    interruptKeys: herdr.interruptKeys ?? null,
   });
 }
 
@@ -2551,9 +2560,11 @@ export class PiRpcAgentClient implements AgentClient {
 
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
-  private readonly providerOptions: PiProviderOptions;
   private readonly runtime?: PiRuntime;
-  private readonly herdrClient: HerdrClient | null;
+  /** Test seam; see `PiRpcAgentClientOptions.herdrClient`. */
+  private readonly injectedHerdrClient: HerdrClient | null;
+  /** Keyed by option set: one agent client instance is reused across configs. */
+  private readonly herdrClientCache: Map<string, HerdrClient>;
   private readonly usagePollScheduler?: PiUsagePollScheduler;
 
   constructor(options: PiRpcAgentClientOptions) {
@@ -2561,13 +2572,36 @@ export class PiRpcAgentClient implements AgentClient {
     this.capabilities = capabilitiesForClient();
     this.logger = options.logger;
     this.runtimeSettings = options.runtimeSettings;
-    this.providerOptions = PiProviderOptionsSchema.parse(options.providerParams ?? {});
     this.runtime = options.runtime;
-    this.herdrClient =
-      options.herdrClient === undefined
-        ? createHerdrClient(this.providerOptions)
-        : options.herdrClient;
+    this.injectedHerdrClient = options.herdrClient ?? null;
+    this.herdrClientCache = new Map();
     this.usagePollScheduler = options.usagePollScheduler;
+  }
+
+  /**
+   * Herdr settings arrive on the call and never on the constructor:
+   * `provider-registry.ts` merges configured options into `config.providerOptions`,
+   * `ListImportableSessionsOptions.providerOptions` and resume `overrides`, never into
+   * this client. Reading them here is what lets `herdr.enabled` reach the CLI at all.
+   */
+  private resolveHerdrClient(providerOptions: PiProviderOptions): HerdrClient | null {
+    // Test seam: the registry factory never injects one, so production always falls
+    // through to the real client. `herdr-option-plumbing.test.ts` covers that path with
+    // a real subprocess and no injection.
+    if (this.injectedHerdrClient) {
+      return this.injectedHerdrClient;
+    }
+    if (!providerOptions.herdr.enabled) {
+      return null;
+    }
+    const key = herdrClientCacheKey(providerOptions.herdr);
+    const cached = this.herdrClientCache.get(key);
+    if (cached) {
+      return cached;
+    }
+    const client = createHerdrClient(providerOptions);
+    this.herdrClientCache.set(key, client);
+    return client;
   }
 
   async createSession(
@@ -2626,9 +2660,14 @@ export class PiRpcAgentClient implements AgentClient {
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    // Parse per-call options BEFORE the herdr branch: attached handles short-circuit
+    // ahead of the normal resume path, and persisted records carry no provider options,
+    // so the registry-merged per-call options are the only carrier of herdr settings on
+    // daemon restart.
+    const resumeProviderOptions = PiProviderOptionsSchema.parse(overrides?.providerOptions ?? {});
     const attachedMetadata = parseHerdrAttachedPiMetadata(handle.metadata);
     if (attachedMetadata) {
-      return this.createHerdrAttachedSession(attachedMetadata, overrides);
+      return this.createHerdrAttachedSession(attachedMetadata, overrides, resumeProviderOptions);
     }
     if (handle.metadata?.runtime === HERDR_ATTACHED_PI_RUNTIME) {
       throw new Error("Invalid Herdr-attached Pi persistence metadata");
@@ -2639,6 +2678,15 @@ export class PiRpcAgentClient implements AgentClient {
       throw new Error("Pi resume requires a native session file handle");
     }
 
+    return this.resumeManagedSession(handle, overrides, launchContext, sessionFile);
+  }
+
+  private async resumeManagedSession(
+    handle: AgentPersistenceHandle,
+    overrides: Partial<AgentSessionConfig> | undefined,
+    launchContext: AgentLaunchContext | undefined,
+    sessionFile: string,
+  ): Promise<AgentSession> {
     const persistenceMetadata = parsePersistenceMetadata(handle.metadata);
     const resumeConfig = buildResumeConfig(persistenceMetadata, overrides, this.provider);
 
@@ -2830,25 +2878,38 @@ export class PiRpcAgentClient implements AgentClient {
   private async listHerdrAttachedImportableSessions(
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
-    if (!this.herdrClient) {
+    const providerOptions = PiProviderOptionsSchema.parse(options?.providerOptions ?? {});
+    const herdrClient = this.resolveHerdrClient(providerOptions);
+    if (!herdrClient) {
       return [];
     }
 
     let agents: HerdrAgent[];
     try {
-      agents = await this.herdrClient.listAgents();
+      agents = await herdrClient.listAgents();
     } catch (error) {
-      this.logger.debug({ err: error }, "Failed to list Herdr agents for Pi import discovery");
+      // Herdr is explicitly enabled but unreachable. This must not fail silently the way
+      // a disabled provider does: log at info, not debug, so the operator sees why the
+      // "Live Pi:" rows are missing.
+      this.logger.info(
+        { err: error },
+        "Failed to list Herdr agents for Pi import discovery (Herdr is enabled but unreachable)",
+      );
       return [];
     }
 
     const matchesCwd = options?.cwd ? createRealpathAwarePathMatcher(options.cwd) : null;
     const rows: ImportableProviderSession[] = [];
     for (const agent of agents) {
-      const row = await this.toHerdrImportableSession(agent).catch((error) => {
-        this.logger.debug({ err: error, target: agent.target }, "Failed to inspect Herdr Pi agent");
-        return null;
-      });
+      const row = await this.toHerdrImportableSession(agent, herdrClient, providerOptions).catch(
+        (error) => {
+          this.logger.debug(
+            { err: error, target: agent.target },
+            "Failed to inspect Herdr Pi agent",
+          );
+          return null;
+        },
+      );
       if (!row || (matchesCwd && !matchesCwd(row.cwd))) {
         continue;
       }
@@ -2859,13 +2920,12 @@ export class PiRpcAgentClient implements AgentClient {
 
   private async toHerdrImportableSession(
     agent: HerdrAgent,
+    herdrClient: HerdrClient,
+    providerOptions: PiProviderOptions,
   ): Promise<ImportableProviderSession | null> {
-    if (!this.herdrClient) {
-      return null;
-    }
     const detailed = isAttachableHerdrPiAgent(agent)
       ? agent
-      : await this.herdrClient.getAgent(agent.target).catch(() => agent);
+      : await herdrClient.getAgent(agent.target).catch(() => agent);
     if (!isAttachableHerdrPiAgent(detailed)) {
       return null;
     }
@@ -2878,7 +2938,7 @@ export class PiRpcAgentClient implements AgentClient {
     const history = await readPiNativeHistory(nativeSessionFile);
     const metadata: HerdrAttachedPiMetadata = {
       runtime: HERDR_ATTACHED_PI_RUNTIME,
-      herdrSession: this.providerOptions.herdr.session ?? "default",
+      herdrSession: providerOptions.herdr.session ?? "default",
       herdrTarget: detailed.target,
       ...(detailed.name ? { herdrAlias: detailed.name } : {}),
       ...(detailed.paneId ? { herdrPaneId: detailed.paneId } : {}),
@@ -2919,7 +2979,12 @@ export class PiRpcAgentClient implements AgentClient {
       provider: this.provider,
       cwd: input.cwd,
     } as AgentSessionConfig;
-    const session = this.createHerdrAttachedSession({ ...metadata, cwd: input.cwd }, config);
+    const providerOptions = PiProviderOptionsSchema.parse(context.config.providerOptions ?? {});
+    const session = this.createHerdrAttachedSession(
+      { ...metadata, cwd: input.cwd },
+      config,
+      providerOptions,
+    );
     const timeline = await collectPiHistoryTimeline(session.streamHistory());
     return {
       session,
@@ -2932,11 +2997,13 @@ export class PiRpcAgentClient implements AgentClient {
   private createHerdrAttachedSession(
     metadata: HerdrAttachedPiMetadata,
     overrides?: Partial<AgentSessionConfig>,
+    providerOptions: PiProviderOptions = PiProviderOptionsSchema.parse({}),
   ): HerdrAttachedPiSession {
-    if (!this.herdrClient) {
+    const herdrClient = this.resolveHerdrClient(providerOptions);
+    if (!herdrClient) {
       throw new Error("Herdr attached Pi session requires Herdr support to be enabled");
     }
-    const configuredHerdrSession = this.providerOptions.herdr.session ?? "default";
+    const configuredHerdrSession = providerOptions.herdr.session ?? "default";
     if (metadata.herdrSession !== configuredHerdrSession) {
       throw new Error(
         `Herdr attached Pi session belongs to ${metadata.herdrSession}, not ${configuredHerdrSession}`,
@@ -2948,13 +3015,13 @@ export class PiRpcAgentClient implements AgentClient {
       this.provider,
     );
     return new HerdrAttachedPiSession({
-      herdrClient: this.herdrClient,
+      herdrClient,
       metadata: {
         ...metadata,
         cwd: config.cwd,
       },
       config: config.config,
-      pollIntervalMs: this.providerOptions.herdr.pollIntervalMs,
+      pollIntervalMs: providerOptions.herdr.pollIntervalMs,
     });
   }
 

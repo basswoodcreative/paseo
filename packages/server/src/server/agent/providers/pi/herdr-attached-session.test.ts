@@ -98,6 +98,17 @@ function validHerdrAgent(metadata: HerdrAttachedPiMetadata, file: string): Herdr
   };
 }
 
+/**
+ * The carrier production uses. `provider-registry.ts` merges the configured provider
+ * options into each call (`config.providerOptions`,
+ * `ListImportableSessionsOptions.providerOptions`, resume `overrides.providerOptions`)
+ * and never into the constructor -- that seam is what let these tests disagree with the
+ * daemon while still passing.
+ */
+function callProviderOptions(herdr: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+  return { ...extra, herdr: { enabled: true, ...herdr } };
+}
+
 describe("Herdr attached Pi sessions", () => {
   test("lists a live Herdr Pi through Pi import discovery and hides the duplicate native file row", async () => {
     const { file, metadata } = await createAttachment();
@@ -119,10 +130,17 @@ describe("Herdr attached Pi sessions", () => {
       logger: pino({ level: "silent" }),
       runtime: new FakePi(),
       herdrClient: herdr,
-      providerParams: { sessionDir: path.dirname(file), herdr: { session: metadata.herdrSession } },
     });
 
-    await expect(client.listImportableSessions({ limit: 10 })).resolves.toEqual([
+    await expect(
+      client.listImportableSessions({
+        limit: 10,
+        providerOptions: callProviderOptions(
+          { session: metadata.herdrSession },
+          { sessionDir: path.dirname(file) },
+        ),
+      }),
+    ).resolves.toEqual([
       expect.objectContaining({
         providerHandleId: encodeHerdrAttachedPiHandle(metadata),
         cwd: metadata.cwd,
@@ -137,8 +155,13 @@ describe("Herdr attached Pi sessions", () => {
     const client = new PiRpcAgentClient({
       logger: pino({ level: "silent" }),
       runtime: new FakePi(),
-      providerParams: {
+    });
+
+    await client.listImportableSessions({
+      limit: 10,
+      providerOptions: {
         sessionDir: path.dirname(file),
+        // `enabled` defaults to false: a configured but disabled Herdr must stay inert.
         herdr: {
           command: [
             process.execPath,
@@ -148,8 +171,6 @@ describe("Herdr attached Pi sessions", () => {
         },
       },
     });
-
-    await client.listImportableSessions({ limit: 10 });
 
     await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -188,12 +209,14 @@ describe("Herdr attached Pi sessions", () => {
       logger: pino({ level: "silent" }),
       runtime: new FakePi(),
       herdrClient: herdr,
-      providerParams: { sessionDir, herdr: { session: "fm-lab-session" } },
     });
 
-    await expect(client.listImportableSessions({ limit: 1 })).resolves.toEqual([
-      expect.objectContaining({ title: "Live Pi: newer" }),
-    ]);
+    await expect(
+      client.listImportableSessions({
+        limit: 1,
+        providerOptions: callProviderOptions({ session: "fm-lab-session" }, { sessionDir }),
+      }),
+    ).resolves.toEqual([expect.objectContaining({ title: "Live Pi: newer" })]);
   });
 
   test("imports and prompts a Herdr Pi without launching a managed Pi RPC runtime", async () => {
@@ -205,12 +228,18 @@ describe("Herdr attached Pi sessions", () => {
       logger: pino({ level: "silent" }),
       runtime: pi,
       herdrClient: herdr,
-      providerParams: { herdr: { session: metadata.herdrSession, pollIntervalMs: 60_000 } },
     });
     const imported = await client.importSession(
       { providerHandleId: encodeHerdrAttachedPiHandle(metadata), cwd: metadata.cwd },
       {
-        config: { provider: "pi", cwd: metadata.cwd },
+        config: {
+          provider: "pi",
+          cwd: metadata.cwd,
+          providerOptions: callProviderOptions({
+            session: metadata.herdrSession,
+            pollIntervalMs: 60_000,
+          }),
+        },
         storedConfig: { provider: "pi", cwd: metadata.cwd },
       },
     );
@@ -284,15 +313,22 @@ describe("Herdr attached Pi sessions", () => {
       logger: pino({ level: "silent" }),
       runtime: pi,
       herdrClient: herdr,
-      providerParams: { herdr: { session: metadata.herdrSession, pollIntervalMs: 60_000 } },
     });
 
-    const session = await client.resumeSession({
-      provider: "pi",
-      sessionId: encodeHerdrAttachedPiHandle(metadata),
-      nativeHandle: file,
-      metadata,
-    });
+    const session = await client.resumeSession(
+      {
+        provider: "pi",
+        sessionId: encodeHerdrAttachedPiHandle(metadata),
+        nativeHandle: file,
+        metadata,
+      },
+      {
+        providerOptions: callProviderOptions({
+          session: metadata.herdrSession,
+          pollIntervalMs: 60_000,
+        }),
+      },
+    );
     await session.startTurn("after restart");
     await session.close();
 
@@ -460,16 +496,18 @@ describe("Herdr attached Pi sessions", () => {
       logger: pino({ level: "silent" }),
       runtime: pi,
       herdrClient: new FakeHerdrClient(),
-      providerParams: { herdr: { session: "different-session" } },
     });
 
     await expect(
-      client.resumeSession({
-        provider: "pi",
-        sessionId: encodeHerdrAttachedPiHandle(metadata),
-        nativeHandle: file,
-        metadata,
-      }),
+      client.resumeSession(
+        {
+          provider: "pi",
+          sessionId: encodeHerdrAttachedPiHandle(metadata),
+          nativeHandle: file,
+          metadata,
+        },
+        { providerOptions: callProviderOptions({ session: "different-session" }) },
+      ),
     ).rejects.toThrow("belongs to fm-lab-session, not different-session");
     expect(pi.recordedLaunches).toEqual([]);
   });
